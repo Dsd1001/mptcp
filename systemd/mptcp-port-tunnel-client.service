@@ -1,0 +1,49 @@
+[Unit]
+Description=MPTCP TCP entrance with a file-backed relay target
+Documentation=file:/usr/share/doc/mptcp-ab-switch/README.md
+Wants=network-online.target
+After=network-online.target mptcp-ab-bootstrap.service
+Requires=mptcp-ab-bootstrap.service
+ConditionPathExists=/etc/mptcp-ab/client.env
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mptcp-ab/client.env
+ExecStartPre=+/usr/local/sbin/mptcp-abctl validate-runtime
+ExecStart=/usr/local/bin/mptcp-port-tunnel client tcp \
+    --listen ${LISTEN_ADDRESS} \
+    --server-file ${SERVER_FILE} \
+    --dial-timeout 10s \
+    --max-connections 1024 \
+    --tcp-user-timeout 45s \
+    --tcp-keepalive-idle 2m \
+    --tcp-keepalive-interval 15s \
+    --tcp-keepalive-count 3 \
+    --tcp-idle-timeout 15m \
+    --tcp-soft-max-age 1h \
+    --tcp-soft-age-idle-grace 30s \
+    --tcp-hard-max-age 2h \
+    --tcp-max-age-jitter 20%% \
+    --retired-target-idle-timeout 2m \
+    --retired-target-max-age 15m
+Restart=always
+RestartSec=2s
+TimeoutStopSec=30s
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/mptcp-ab
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

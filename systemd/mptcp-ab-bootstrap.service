@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply the current MPTCP A/B group at boot
+Wants=network-online.target
+Requires=mptcp-ab-network.service
+After=network-online.target systemd-sysctl.service mptcp-ab-network.service
+Before=mptcp-port-tunnel-client.service
+ConditionPathExists=/etc/mptcp-ab/config.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mptcp-abctl switch --boot
+RemainAfterExit=yes
+TimeoutStartSec=420s
+
+[Install]
+WantedBy=multi-user.target

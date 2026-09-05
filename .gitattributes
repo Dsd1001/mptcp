@@ -1,0 +1,3 @@
+* text=auto eol=lf
+payload/linux-amd64/mptcp-port-tunnel binary
+payload/linux-arm64/mptcp-port-tunnel binary

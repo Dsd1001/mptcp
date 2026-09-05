@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply the scheduled MPTCP A/B group
+Wants=network-online.target mptcp-ab-bootstrap.service
+After=network-online.target mptcp-ab-bootstrap.service
+ConditionPathExists=/etc/mptcp-ab/config.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mptcp-abctl switch --scheduled
+Restart=on-failure
+RestartSec=45s
+TimeoutStartSec=720s

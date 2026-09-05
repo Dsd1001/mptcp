@@ -1,0 +1,25 @@
+# Publish only reviewed project files. Host evidence remains local.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/README.zh-CN.md
+!/install.sh
+!/bin/
+!/lib/
+!/systemd/
+!/examples/
+!/tunnel/
+!/tests/
+!/scripts/
+!/docs/
+!/payload/
+**/.DS_Store
+**/._*
+**/__pycache__/
+**/*.pyc
+**/*.log
+**/.env
+**/.env.*
+**/*.pem
+**/*.key

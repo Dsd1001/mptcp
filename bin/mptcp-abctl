@@ -1,0 +1,1343 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+if [[ -n ${MPTCP_AB_LIB:-} ]]; then
+    LIB_FILE=$MPTCP_AB_LIB
+elif [[ -f $SELF_DIR/../lib/mptcp-ab-lib.sh ]]; then
+    LIB_FILE=$SELF_DIR/../lib/mptcp-ab-lib.sh
+else
+    LIB_FILE=/usr/local/lib/mptcp-ab/mptcp-ab-lib.sh
+fi
+# shellcheck source=../lib/mptcp-ab-lib.sh
+. "$LIB_FILE"
+# shellcheck source=../lib/mptcp-ab-network.sh
+. "${LIB_FILE%/*}/mptcp-ab-network.sh"
+
+IP_CMD=${MPTCP_AB_IP_CMD:-$(command -v ip 2>/dev/null || true)}
+SS_CMD=${MPTCP_AB_SS_CMD:-$(command -v ss 2>/dev/null || true)}
+SYSTEMCTL_CMD=${MPTCP_AB_SYSTEMCTL_CMD:-$(command -v systemctl 2>/dev/null || true)}
+TIMEDATECTL_CMD=${MPTCP_AB_TIMEDATECTL_CMD:-$(command -v timedatectl 2>/dev/null || true)}
+FLOCK_CMD=${MPTCP_AB_FLOCK_CMD:-$(command -v flock 2>/dev/null || true)}
+TIMEOUT_CMD=${MPTCP_AB_TIMEOUT_CMD:-$(command -v timeout 2>/dev/null || true)}
+NC_CMD=${MPTCP_AB_NC_CMD:-$(command -v nc 2>/dev/null || true)}
+STAT_CMD=${MPTCP_AB_STAT_CMD:-$(command -v stat 2>/dev/null || true)}
+ACTIVE_GROUP_FILE=$MPTCP_AB_STATE_DIR/active-group
+LANDING_OWNERSHIP_FILE=${MPTCP_AB_LANDING_OWNERSHIP_FILE:-$MPTCP_AB_STATE_DIR/landing-runtime.state}
+LANDING_TRANSACTION_DIR=$MPTCP_AB_STATE_DIR/landing-transaction
+CLIENT_ENV_FILE=${MPTCP_AB_CLIENT_ENV_FILE:-/etc/mptcp-ab/client.env}
+LOCK_FILE=$MPTCP_AB_RUN_DIR/switch.lock
+
+usage()
+{
+    cat <<'EOF'
+Usage: mptcp-abctl COMMAND [OPTIONS]
+
+Commands:
+  validate-config [FILE]       Parse and validate configuration
+  current-group [HHMM]         Print the scheduled group
+  plan [--group A|B]           Show the changes without applying them
+  switch [--scheduled|--boot] [--group A|B]
+                                Apply the selected/current group
+  cleanup-landing             Remove owned Landing endpoints and restore limits
+  probe [A|B]                  Probe relay candidates in order
+  status                        Show concise runtime state
+  doctor                        Run installation and runtime checks
+  validate-runtime             Validate the Edge client prerequisites
+  network-plan                 Print managed nftables rules without applying
+  network-apply                Apply role-specific port mapping / forwarding
+  network-cleanup              Remove only owned nftables tables
+
+Environment overrides beginning with MPTCP_AB_ are intended for tests.
+EOF
+}
+
+require_root()
+{
+    if [[ ${MPTCP_AB_ALLOW_NONROOT:-0} != 1 && $EUID -ne 0 ]]; then
+        ab_error "this command must run as root"
+        exit 1
+    fi
+}
+
+require_command_path()
+{
+    local value=$1
+    local name=$2
+    [[ -n $value && -x $value ]] || { ab_error "required command not found: $name"; return 1; }
+}
+
+read_limits()
+{
+    local output key value subflows= accepted=
+    local fields=()
+    local index
+
+    require_command_path "$IP_CMD" ip || return 1
+    output=$($IP_CMD mptcp limits show 2>/dev/null) || return 1
+    read -r -a fields <<<"$output"
+    [[ ${#fields[@]} -eq 4 ]] || return 1
+    index=0
+    while ((index < 4)); do
+        key=${fields[$index]}
+        value=${fields[$((index + 1))]}
+        ab_is_uint "$value" || return 1
+        case $key in
+            subflows) subflows=$value ;;
+            add_addr_accepted) accepted=$value ;;
+            *) return 1 ;;
+        esac
+        index=$((index + 2))
+    done
+    [[ -n $subflows && -n $accepted ]] || return 1
+    printf '%s %s\n' "$subflows" "$accepted"
+}
+
+set_limits()
+{
+    $IP_CMD mptcp limits set subflows "$SUBFLOWS" add_addr_accepted "$ADD_ADDR_ACCEPTED"
+}
+
+limits_match()
+{
+    [[ $(read_limits 2>/dev/null || true) == "$SUBFLOWS $ADD_ADDR_ACCEPTED" ]]
+}
+
+time_is_synchronized()
+{
+    [[ $MODE == aggregate || $REQUIRE_TIME_SYNC == no ]] && return 0
+    require_command_path "$TIMEDATECTL_CMD" timedatectl || return 1
+    [[ $($TIMEDATECTL_CMD show -p NTPSynchronized --value 2>/dev/null) == yes ]]
+}
+
+wait_for_boot_time_sync()
+{
+    local attempts=${MPTCP_AB_BOOT_SYNC_ATTEMPTS:-60}
+    local interval=${MPTCP_AB_BOOT_SYNC_INTERVAL:-2}
+    local attempt
+
+    [[ $MODE == aggregate || $REQUIRE_TIME_SYNC == no ]] && return 0
+    ab_is_uint "$attempts" && ((10#$attempts >= 1)) || {
+        ab_error "invalid boot time-sync attempt count"
+        return 1
+    }
+    [[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        ab_error "invalid boot time-sync interval"
+        return 1
+    }
+    for ((attempt = 1; attempt <= 10#$attempts; attempt++)); do
+        time_is_synchronized && return 0
+        if ((attempt == 1)); then
+            ab_warn "waiting for the system clock to synchronize"
+        fi
+        ((attempt < 10#$attempts)) && sleep "$interval"
+    done
+    ab_error "time is not synchronized after $attempts checks"
+}
+
+read_active_target()
+{
+    local value
+    [[ -f $EDGE_SERVER_FILE ]] || return 1
+    [[ $(wc -l <"$EDGE_SERVER_FILE") -eq 1 ]] || return 1
+    value=$(sed -n '1p' "$EDGE_SERVER_FILE")
+    [[ $value == *:* ]] || return 1
+    ab_valid_ipv4 "${value%:*}" && ab_valid_port "${value##*:}" || return 1
+    printf '%s\n' "$value"
+}
+
+listener_ready()
+{
+    local listen_host=${LISTEN_ADDRESS%:*}
+    local listen_port=${LISTEN_ADDRESS##*:}
+    local address
+
+    require_command_path "$SS_CMD" ss || return 1
+    while read -r address; do
+        case $listen_host in
+            0.0.0.0)
+                [[ $address == "0.0.0.0:$listen_port" || $address == "*:$listen_port" || $address == "[::]:$listen_port" ]] && return 0
+                ;;
+            *) [[ $address == "$LISTEN_ADDRESS" ]] && return 0 ;;
+        esac
+    done < <($SS_CMD -4 -H -ltn 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+poll_edge_ready()
+{
+    local attempts=${MPTCP_AB_READY_ATTEMPTS:-20}
+    local interval=${MPTCP_AB_READY_INTERVAL:-1}
+    local attempt
+
+    ab_is_uint "$attempts" && ((10#$attempts >= 1)) || {
+        ab_error "invalid Edge readiness attempt count"
+        return 1
+    }
+    [[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        ab_error "invalid Edge readiness interval"
+        return 1
+    }
+    for ((attempt = 1; attempt <= 10#$attempts; attempt++)); do
+        if $SYSTEMCTL_CMD is-active --quiet "$EDGE_SERVICE" && listener_ready; then
+            return 0
+        fi
+        ((attempt < 10#$attempts)) && sleep "$interval"
+    done
+    return 1
+}
+
+probe_target()
+{
+    local ip=$1
+    local target="$ip:$LANDING_PORT"
+    local attempt
+
+    for ((attempt = 1; attempt <= 10#$PROBE_ATTEMPTS; attempt++)); do
+        if [[ -x $EDGE_BINARY ]] && "$EDGE_BINARY" probe --server "$target" --timeout "${PROBE_TIMEOUT}s" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ ! -x $EDGE_BINARY ]]; then
+            require_command_path "$TIMEOUT_CMD" timeout || return 1
+            require_command_path "$NC_CMD" nc || return 1
+            if "$TIMEOUT_CMD" "$PROBE_TIMEOUT" "$NC_CMD" -z -w "$PROBE_TIMEOUT" "$ip" "$LANDING_PORT" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        ((attempt < 10#$PROBE_ATTEMPTS)) && sleep 1
+    done
+    return 1
+}
+
+select_edge_target()
+{
+    local group=$1
+    local current_ip=${2:-}
+    local candidate
+
+    while IFS= read -r candidate; do
+        [[ -n $candidate ]] || continue
+        if probe_target "$candidate"; then
+            ab_log "group $group relay $candidate:$(ab_relay_port "$candidate") is healthy (logical port $LANDING_PORT)"
+            printf '%s:%s\n' "$candidate" "$LANDING_PORT"
+            return 0
+        fi
+        ab_warn "group $group relay $candidate:$(ab_relay_port "$candidate") did not answer"
+    done < <(ab_group_candidates "$group" "$current_ip")
+
+    ab_select_group "$group"
+    if [[ $FAIL_OPEN == yes ]]; then
+        ab_warn "group $group has no healthy relay; using configured primary $AB_GROUP_PRIMARY"
+        printf '%s:%s\n' "$AB_GROUP_PRIMARY" "$LANDING_PORT"
+        return 0
+    fi
+    ab_error "group $group has no healthy relay; keeping the previous target"
+    return 1
+}
+
+write_group_state()
+{
+    ab_atomic_write "$ACTIVE_GROUP_FILE" "$1" 0600
+}
+
+restore_file_snapshot()
+{
+    local present=$1
+    local snapshot=$2
+    local target=$3
+    local mode=$4
+
+    if [[ $present == 1 ]]; then
+        ab_atomic_write "$target" "$snapshot" "$mode"
+    else
+        rm -f "$target"
+    fi
+}
+
+edge_plan()
+{
+    local group=$1
+    ab_select_group "$group"
+    cat <<EOF
+role=edge
+group=$group
+candidates=$AB_GROUP_CSV
+preferred_target=$AB_GROUP_PRIMARY:$LANDING_PORT
+server_file=$EDGE_SERVER_FILE
+client_service=$EDGE_SERVICE
+limits=$SUBFLOWS/$ADD_ADDR_ACCEPTED
+operation=probe candidates, atomically update target, restart client, verify, rollback on failure
+EOF
+}
+
+apply_edge()
+{
+    local group=$1
+    local mode=$2
+    local follow_schedule=${3:-0}
+    local current_target= current_ip= desired_target
+    local target_present=0 target_snapshot=
+    local group_present=0 group_snapshot=
+    local limits_snapshot service_was_active=0 need_restart=1 restart_attempted=0
+    local rollback_failed=0 target_restored=1 latest_group
+
+    if current_target=$(read_active_target 2>/dev/null); then
+        current_ip=${current_target%:*}
+    fi
+    if ! desired_target=$(select_edge_target "$group" "$current_ip"); then
+        if [[ $follow_schedule == 1 ]]; then
+            latest_group=$(ab_desired_group_now) || return 1
+            if [[ $latest_group != "$group" ]]; then
+                ab_warn "schedule changed from group $group to $latest_group while failed relay probes were running; selecting again"
+                return 75
+            fi
+        fi
+        return 1
+    fi
+    if [[ $follow_schedule == 1 ]]; then
+        latest_group=$(ab_desired_group_now) || return 1
+        if [[ $latest_group != "$group" ]]; then
+            ab_warn "schedule changed from group $group to $latest_group during relay probing; selecting again"
+            return 75
+        fi
+    fi
+    limits_snapshot=$(read_limits) || { ab_error "cannot snapshot MPTCP limits"; return 1; }
+    if [[ -f $EDGE_SERVER_FILE ]]; then
+        target_present=1
+        target_snapshot=$(cat "$EDGE_SERVER_FILE")
+    fi
+    if [[ -f $ACTIVE_GROUP_FILE ]]; then
+        group_present=1
+        group_snapshot=$(cat "$ACTIVE_GROUP_FILE")
+    fi
+    if [[ -n $SYSTEMCTL_CMD ]] && $SYSTEMCTL_CMD is-active --quiet "$EDGE_SERVICE"; then
+        service_was_active=1
+    fi
+    if [[ $desired_target == "$current_target" && $group_present == 1 && $group_snapshot == "$group" ]] && limits_match; then
+        need_restart=0
+    fi
+
+    if ! ab_atomic_write "$EDGE_SERVER_FILE" "$desired_target" 0644 ||
+       ! set_limits ||
+       ! write_group_state "$group"; then
+        ab_error "failed to write Edge state" || :
+    elif [[ $mode == boot && $service_was_active == 0 ]]; then
+        ab_log "Edge group $group prepared with target $desired_target"
+        return 0
+    elif [[ $need_restart == 0 && $service_was_active == 1 ]] && listener_ready; then
+        ab_log "Edge group $group already active with target $desired_target"
+        return 0
+    elif require_command_path "$SYSTEMCTL_CMD" systemctl; then
+        restart_attempted=1
+        if $SYSTEMCTL_CMD restart "$EDGE_SERVICE" &&
+           poll_edge_ready &&
+           [[ $(read_active_target) == "$desired_target" ]] && limits_match; then
+            ab_log "Edge group $group target $desired_target is active and verified"
+            return 0
+        fi
+    fi
+
+    ab_warn "Edge transaction failed; restoring previous state"
+    restore_file_snapshot "$target_present" "$target_snapshot" "$EDGE_SERVER_FILE" 0644 || {
+        rollback_failed=1
+        target_restored=0
+    }
+    restore_file_snapshot "$group_present" "$group_snapshot" "$ACTIVE_GROUP_FILE" 0600 || rollback_failed=1
+    # shellcheck disable=SC2086
+    $IP_CMD mptcp limits set subflows ${limits_snapshot%% *} add_addr_accepted ${limits_snapshot##* } || rollback_failed=1
+    if [[ $service_was_active == 1 ]]; then
+        if [[ $target_restored == 1 ]]; then
+            $SYSTEMCTL_CMD restart "$EDGE_SERVICE" && poll_edge_ready || rollback_failed=1
+        else
+            $SYSTEMCTL_CMD stop "$EDGE_SERVICE" || rollback_failed=1
+        fi
+    elif [[ $restart_attempted == 1 ]]; then
+        $SYSTEMCTL_CMD stop "$EDGE_SERVICE" || rollback_failed=1
+    fi
+    ((rollback_failed == 0)) || { ab_error "Edge rollback was incomplete"; return 2; }
+    ab_log "Edge rollback completed"
+    return 1
+}
+
+endpoint_line_id()
+{
+    local line=$1
+    local fields=()
+    local index
+    read -r -a fields <<<"$line"
+    for ((index = 1; index + 1 < ${#fields[@]}; index++)); do
+        if [[ ${fields[$index]} == id ]]; then
+            ab_is_uint "${fields[$((index + 1))]}" || return 1
+            printf '%s\n' "${fields[$((index + 1))]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+endpoint_line_record()
+{
+    local line=$1
+    local fields=()
+    local id address device
+
+    read -r -a fields <<<"$line"
+    [[ ${#fields[@]} -eq 6 && ${fields[1]} == id && ${fields[3]} == signal && ${fields[4]} == dev ]] || return 1
+    address=${fields[0]}
+    id=${fields[2]}
+    device=${fields[5]}
+    ab_valid_ipv4 "$address" || return 1
+    ab_is_uint "$id" && ((10#$id >= 1 && 10#$id <= 255)) || return 1
+    [[ $device =~ ^[A-Za-z0-9_.:-]+$ ]] || return 1
+    printf '%s %s %s\n' "$id" "$address" "$device"
+}
+
+record_file_has_id()
+{
+    local file=$1
+    local wanted=$2
+    local id address device
+
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        [[ $id == "$wanted" ]] && return 0
+    done <"$file"
+    return 1
+}
+
+record_file_get()
+{
+    local file=$1
+    local wanted=$2
+    local id address device
+
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        if [[ $id == "$wanted" ]]; then
+            printf '%s %s %s\n' "$id" "$address" "$device"
+            return 0
+        fi
+    done <"$file"
+    return 1
+}
+
+record_file_contains()
+{
+    local file=$1
+    local wanted=$2
+    local line
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == "$wanted" ]] && return 0
+    done <"$file"
+    return 1
+}
+
+capture_endpoint_inventory()
+{
+    local records=$1
+    local ids=$2
+    local raw=$records.raw
+    local line id record
+
+    : >"$records"
+    : >"$ids"
+    if ! $IP_CMD mptcp endpoint show >"$raw"; then
+        rm -f "$raw"
+        ab_error "cannot read MPTCP endpoints"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        id=$(endpoint_line_id "$line" 2>/dev/null || true)
+        [[ -n $id ]] || continue
+        if grep -qx -- "$id" "$ids"; then
+            rm -f "$raw"
+            ab_error "MPTCP endpoint id $id appears more than once"
+            return 1
+        fi
+        printf '%s\n' "$id" >>"$ids"
+        if record=$(endpoint_line_record "$line" 2>/dev/null); then
+            printf '%s\n' "$record" >>"$records"
+        fi
+    done <"$raw"
+    rm -f "$raw"
+    sort -n -o "$records" "$records"
+    sort -n -o "$ids" "$ids"
+}
+
+load_landing_ownership()
+{
+    local output=$1
+    local line key first second third extra
+    local schema_seen=0 original_seen=0 managed_seen=0 endpoint_count=0 seen_ids='|'
+
+    LANDING_OWNERSHIP_PRESENT=0
+    LANDING_ORIGINAL_LIMITS=
+    LANDING_MANAGED_LIMITS=
+    : >"$output"
+    [[ -e $LANDING_OWNERSHIP_FILE || -L $LANDING_OWNERSHIP_FILE ]] || return 0
+    [[ -f $LANDING_OWNERSHIP_FILE && ! -L $LANDING_OWNERSHIP_FILE ]] || {
+        ab_error "Landing ownership state is not a regular file: $LANDING_OWNERSHIP_FILE"
+        return 1
+    }
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || { ab_error "invalid blank line in Landing ownership state"; return 1; }
+        read -r key first second third extra <<<"$line"
+        case $key in
+            schema)
+                [[ $schema_seen == 0 && $first == 1 && -z ${second:-} ]] || {
+                    ab_error "invalid schema in Landing ownership state"
+                    return 1
+                }
+                schema_seen=1
+                ;;
+            original_limits|managed_limits)
+                [[ -n ${first:-} && -n ${second:-} && -z ${third:-} ]] &&
+                    ab_is_uint "$first" && ab_is_uint "$second" || {
+                    ab_error "invalid limits in Landing ownership state"
+                    return 1
+                }
+                if [[ $key == original_limits ]]; then
+                    [[ $original_seen == 0 ]] || { ab_error "duplicate original limits in Landing ownership state"; return 1; }
+                    original_seen=1
+                    LANDING_ORIGINAL_LIMITS="$first $second"
+                else
+                    [[ $managed_seen == 0 ]] || { ab_error "duplicate managed limits in Landing ownership state"; return 1; }
+                    managed_seen=1
+                    LANDING_MANAGED_LIMITS="$first $second"
+                fi
+                ;;
+            endpoint)
+                [[ -n ${first:-} && -n ${second:-} && -n ${third:-} && -z ${extra:-} ]] &&
+                    ab_is_uint "$first" && ((10#$first >= 1 && 10#$first <= 255)) &&
+                    ab_valid_ipv4 "$second" && [[ $third =~ ^[A-Za-z0-9_.:-]+$ ]] || {
+                    ab_error "invalid endpoint in Landing ownership state"
+                    return 1
+                }
+                [[ $seen_ids != *"|$first|"* ]] || { ab_error "duplicate endpoint id $first in Landing ownership state"; return 1; }
+                seen_ids="${seen_ids}${first}|"
+                printf '%s %s %s\n' "$first" "$second" "$third" >>"$output"
+                endpoint_count=$((endpoint_count + 1))
+                ((endpoint_count <= 7)) || { ab_error "too many endpoints in Landing ownership state"; return 1; }
+                ;;
+            *)
+                ab_error "unknown entry in Landing ownership state: $key"
+                return 1
+                ;;
+        esac
+    done <"$LANDING_OWNERSHIP_FILE"
+    [[ $schema_seen == 1 && $original_seen == 1 && $managed_seen == 1 ]] || {
+        ab_error "Landing ownership state is incomplete"
+        return 1
+    }
+    sort -n -o "$output" "$output"
+    LANDING_OWNERSHIP_PRESENT=1
+}
+
+write_landing_ownership()
+{
+    local original_limits=$1
+    local endpoints=$2
+    local original_subflows original_accepted id address device content
+
+    read -r original_subflows original_accepted <<<"$original_limits"
+    content=$(printf 'schema 1\noriginal_limits %s %s\nmanaged_limits %s %s\n' \
+        "$original_subflows" "$original_accepted" "$SUBFLOWS" "$ADD_ADDR_ACCEPTED"
+        while read -r id address device; do
+            [[ -n ${id:-} ]] || continue
+            printf 'endpoint %s %s %s\n' "$id" "$address" "$device"
+        done <"$endpoints") || return 1
+    ab_atomic_write "$LANDING_OWNERSHIP_FILE" "$content" 0600
+}
+
+write_expected_endpoints()
+{
+    local group=$1
+    local output=$2
+    local address index=1
+
+    : >"$output"
+    while IFS= read -r address; do
+        [[ -n $address ]] || continue
+        printf '%s %s %s\n' "$((10#$ENDPOINT_ID_BASE + index))" "$address" "$ENDPOINT_DEVICE" >>"$output"
+        index=$((index + 1))
+    done < <(ab_group_secondaries "$group")
+}
+
+validate_landing_inventory()
+{
+    local owned=$1
+    local expected=$2
+    local current=$3
+    local work_prefix=$4
+    local records=$work_prefix.records
+    local ids=$work_prefix.ids
+    local id address device wanted actual
+
+    : >"$current"
+    capture_endpoint_inventory "$records" "$ids" || return 1
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        if grep -qx -- "$id" "$ids"; then
+            wanted="$id $address $device"
+            actual=$(record_file_get "$records" "$id" 2>/dev/null || true)
+            [[ $actual == "$wanted" ]] || {
+                ab_error "owned endpoint id $id no longer matches its recorded address, flags, or device"
+                return 1
+            }
+            printf '%s\n' "$wanted" >>"$current"
+        fi
+    done <"$owned"
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        if grep -qx -- "$id" "$ids" && ! record_file_has_id "$owned" "$id"; then
+            ab_error "target endpoint id $id is already used by an endpoint not owned by this tool"
+            return 1
+        fi
+    done <"$expected"
+    sort -n -o "$current" "$current"
+}
+
+remove_endpoint_records()
+{
+    local snapshot=$1
+    local work_prefix=$2
+    local records=$work_prefix.records
+    local ids=$work_prefix.ids
+    local id address device wanted actual
+
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        capture_endpoint_inventory "$records" "$ids" || return 1
+        wanted="$id $address $device"
+        actual=$(record_file_get "$records" "$id" 2>/dev/null || true)
+        [[ $actual == "$wanted" ]] || {
+            ab_error "endpoint id $id changed before it could be removed"
+            return 1
+        }
+        $IP_CMD mptcp endpoint delete id "$id" || return 1
+    done <"$snapshot"
+}
+
+add_endpoint_records()
+{
+    local snapshot=$1
+    local work_prefix=$2
+    local records=$work_prefix.records
+    local ids=$work_prefix.ids
+    local id address device
+
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        capture_endpoint_inventory "$records" "$ids" || return 1
+        if grep -qx -- "$id" "$ids"; then
+            ab_error "endpoint id $id became occupied before it could be added"
+            return 1
+        fi
+        $IP_CMD mptcp endpoint add "$address" id "$id" signal dev "$device" || return 1
+    done <"$snapshot"
+}
+
+build_record_universe()
+{
+    local output=$1
+    shift
+    local source id address device seen='|'
+
+    : >"$output"
+    for source in "$@"; do
+        while read -r id address device; do
+            [[ -n ${id:-} ]] || continue
+            if [[ $seen != *"|$id|"* ]]; then
+                printf '%s %s %s\n' "$id" "$address" "$device" >>"$output"
+                seen="${seen}${id}|"
+            fi
+        done <"$source"
+    done
+    sort -n -o "$output" "$output"
+}
+
+verify_endpoint_records()
+{
+    local desired=$1
+    local universe=$2
+    local work_prefix=$3
+    local records=$work_prefix.records
+    local ids=$work_prefix.ids
+    local id address device wanted actual
+
+    capture_endpoint_inventory "$records" "$ids" || return 1
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        wanted=$(record_file_get "$desired" "$id" 2>/dev/null || true)
+        if [[ -n $wanted ]]; then
+            actual=$(record_file_get "$records" "$id" 2>/dev/null || true)
+            [[ $actual == "$wanted" ]] || return 1
+        elif grep -qx -- "$id" "$ids"; then
+            return 1
+        fi
+    done <"$universe"
+}
+
+reconcile_endpoint_records()
+{
+    local desired=$1
+    local allowed=$2
+    local universe=$3
+    local work_prefix=$4
+    local records=$work_prefix.records
+    local ids=$work_prefix.ids
+    local id address device actual wanted
+
+    capture_endpoint_inventory "$records" "$ids" || return 1
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        grep -qx -- "$id" "$ids" || continue
+        actual=$(record_file_get "$records" "$id" 2>/dev/null || true)
+        [[ -n $actual ]] && record_file_contains "$allowed" "$actual" || {
+            ab_error "cannot roll back endpoint id $id because its live value is not part of this transaction"
+            return 1
+        }
+        wanted=$(record_file_get "$desired" "$id" 2>/dev/null || true)
+        if [[ $actual != "$wanted" ]]; then
+            $IP_CMD mptcp endpoint delete id "$id" || return 1
+        fi
+    done <"$universe"
+
+    capture_endpoint_inventory "$records" "$ids" || return 1
+    while read -r id address device; do
+        [[ -n ${id:-} ]] || continue
+        if ! grep -qx -- "$id" "$ids"; then
+            $IP_CMD mptcp endpoint add "$address" id "$id" signal dev "$device" || return 1
+        fi
+    done <"$desired"
+    verify_endpoint_records "$desired" "$universe" "$work_prefix.verify"
+}
+
+set_limits_values()
+{
+    local values=$1
+    local subflows accepted
+
+    read -r subflows accepted <<<"$values"
+    $IP_CMD mptcp limits set subflows "$subflows" add_addr_accepted "$accepted"
+}
+
+landing_plan()
+{
+    local group=$1
+    local address count=0
+    ab_select_group "$group"
+    printf 'role=landing\ngroup=%s\npreferred_primary=%s:%s\nadvertised_endpoints=' "$group" "$AB_GROUP_PRIMARY" "$(ab_relay_port "$AB_GROUP_PRIMARY")"
+    while IFS= read -r address; do
+        [[ -n $address ]] || continue
+        ((count > 0)) && printf ','
+        printf '%s' "$address"
+        count=$((count + 1))
+    done < <(ab_group_secondaries "$group")
+    printf '\nendpoint_device=%s\nlimits=%s/%s\n' "$ENDPOINT_DEVICE" "$SUBFLOWS" "$ADD_ADDR_ACCEPTED"
+    printf 'operation=replace managed endpoint ids, verify, rollback on failure\n'
+}
+
+prepare_landing_journal()
+(
+    local current=$1 allowed=$2 universe=$3 limits=$4 temp file
+    [[ ! -e $LANDING_TRANSACTION_DIR ]] || { ab_error "unrecovered Landing transaction exists"; return 1; }
+    temp=$(mktemp -d "$MPTCP_AB_STATE_DIR/.landing-transaction.XXXXXX") || return 1
+    trap 'rm -rf "$temp"' EXIT
+    cp "$current" "$temp/current" || return 1
+    cp "$allowed" "$temp/allowed" || return 1
+    cp "$universe" "$temp/universe" || return 1
+    printf '%s\n' "$limits" >"$temp/limits" || return 1
+    if [[ -f $ACTIVE_GROUP_FILE ]]; then
+        cp "$ACTIVE_GROUP_FILE" "$temp/group" || return 1
+    fi
+    if [[ -f $LANDING_OWNERSHIP_FILE ]]; then
+        cp "$LANDING_OWNERSHIP_FILE" "$temp/ownership" || return 1
+    fi
+    for file in "$temp"/*; do
+        sync -f "$file" 2>/dev/null || sync "$file" 2>/dev/null || :
+    done
+    sync -f "$temp" 2>/dev/null || :
+    mv "$temp" "$LANDING_TRANSACTION_DIR" || return 1
+    sync -f "$MPTCP_AB_STATE_DIR" 2>/dev/null || :
+)
+
+finish_landing_journal()
+{
+    local committed=$LANDING_TRANSACTION_DIR.committed
+    # Rename is the commit point; a partial recursive removal must never be recovered.
+    rm -rf "$committed" || return 1
+    mv "$LANDING_TRANSACTION_DIR" "$committed" || return 1
+    sync -f "$MPTCP_AB_STATE_DIR" 2>/dev/null || :
+    rm -rf "$committed" || :
+}
+
+recover_landing_journal()
+{
+    local work_dir=$1 file limits
+    [[ -e $LANDING_TRANSACTION_DIR || -L $LANDING_TRANSACTION_DIR ]] || return 0
+    [[ -d $LANDING_TRANSACTION_DIR && ! -L $LANDING_TRANSACTION_DIR ]] || return 1
+    for file in current allowed universe limits; do
+        [[ -f $LANDING_TRANSACTION_DIR/$file && ! -L $LANDING_TRANSACTION_DIR/$file ]] || {
+            ab_error "Landing transaction journal is incomplete"
+            return 1
+        }
+    done
+    ab_warn "recovering an interrupted Landing transaction"
+    limits=$(cat "$LANDING_TRANSACTION_DIR/limits") || return 1
+    [[ $limits =~ ^[0-9]+\ [0-9]+$ ]] || return 1
+    reconcile_endpoint_records "$LANDING_TRANSACTION_DIR/current" \
+        "$LANDING_TRANSACTION_DIR/allowed" "$LANDING_TRANSACTION_DIR/universe" \
+        "$work_dir/recover" || return 1
+    set_limits_values "$limits" || return 1
+    [[ $(read_limits) == "$limits" ]] || return 1
+    if [[ -f $LANDING_TRANSACTION_DIR/group ]]; then
+        ab_atomic_write "$ACTIVE_GROUP_FILE" "$(cat "$LANDING_TRANSACTION_DIR/group")" 0600 || return 1
+    else
+        rm -f "$ACTIVE_GROUP_FILE" || return 1
+    fi
+    if [[ -f $LANDING_TRANSACTION_DIR/ownership ]]; then
+        ab_atomic_write "$LANDING_OWNERSHIP_FILE" "$(cat "$LANDING_TRANSACTION_DIR/ownership")" 0600 || return 1
+    else
+        rm -f "$LANDING_OWNERSHIP_FILE" || return 1
+    fi
+    finish_landing_journal
+}
+
+apply_landing()
+(
+    local group=$1
+    local work_dir owned current expected universe allowed line
+    local limits_snapshot original_limits group_present=0 group_snapshot=
+    local ownership_present=0 ownership_snapshot= rollback_failed=0
+
+    mkdir -p "$MPTCP_AB_RUN_DIR"
+    work_dir=$(mktemp -d "$MPTCP_AB_RUN_DIR/landing.XXXXXX") || return 1
+    owned=$work_dir/owned
+    current=$work_dir/current
+    expected=$work_dir/expected
+    universe=$work_dir/universe
+    allowed=$work_dir/allowed
+    trap 'rm -rf "$work_dir"' EXIT
+
+    recover_landing_journal "$work_dir" || return 1
+    load_landing_ownership "$owned" || return 1
+    ownership_present=$LANDING_OWNERSHIP_PRESENT
+    if [[ $ownership_present == 1 ]]; then
+        ownership_snapshot=$(cat "$LANDING_OWNERSHIP_FILE")
+    fi
+    write_expected_endpoints "$group" "$expected" || return 1
+    limits_snapshot=$(read_limits) || { ab_error "cannot snapshot MPTCP limits"; return 1; }
+    if [[ $ownership_present == 1 ]]; then
+        original_limits=$LANDING_ORIGINAL_LIMITS
+    else
+        original_limits=$limits_snapshot
+    fi
+    validate_landing_inventory "$owned" "$expected" "$current" "$work_dir/preflight" || return 1
+    build_record_universe "$universe" "$owned" "$expected"
+    cp "$owned" "$allowed"
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        record_file_contains "$allowed" "$line" || printf '%s\n' "$line" >>"$allowed"
+    done <"$expected"
+    if [[ -f $ACTIVE_GROUP_FILE ]]; then
+        group_present=1
+        group_snapshot=$(cat "$ACTIVE_GROUP_FILE")
+    fi
+    if [[ $ownership_present == 1 && $LANDING_MANAGED_LIMITS == "$SUBFLOWS $ADD_ADDR_ACCEPTED" ]] &&
+       cmp -s "$owned" "$expected" && cmp -s "$current" "$expected" &&
+       [[ $group_present == 1 && $group_snapshot == "$group" ]] && limits_match; then
+        ab_log "Landing group $group is already active"
+        return 0
+    fi
+
+    prepare_landing_journal "$current" "$allowed" "$universe" "$limits_snapshot" || return 1
+    if remove_endpoint_records "$current" "$work_dir/remove" &&
+       add_endpoint_records "$expected" "$work_dir/add" &&
+       set_limits &&
+       write_group_state "$group" &&
+       write_landing_ownership "$original_limits" "$expected" &&
+       verify_endpoint_records "$expected" "$universe" "$work_dir/verify" && limits_match &&
+       finish_landing_journal; then
+        ab_log "Landing endpoint group $group is active and verified"
+        return 0
+    fi
+
+    ab_warn "Landing transaction failed; restoring previous state"
+    reconcile_endpoint_records "$current" "$allowed" "$universe" "$work_dir/rollback" || rollback_failed=1
+    set_limits_values "$limits_snapshot" || rollback_failed=1
+    restore_file_snapshot "$group_present" "$group_snapshot" "$ACTIVE_GROUP_FILE" 0600 || rollback_failed=1
+    restore_file_snapshot "$ownership_present" "$ownership_snapshot" "$LANDING_OWNERSHIP_FILE" 0600 || rollback_failed=1
+    verify_endpoint_records "$current" "$universe" "$work_dir/rollback-final" || rollback_failed=1
+    ((rollback_failed == 0)) || { ab_error "Landing rollback was incomplete"; return 2; }
+    finish_landing_journal || return 2
+    ab_log "Landing rollback completed"
+    return 1
+)
+
+run_cleanup_landing()
+(
+    local work_dir owned current empty universe
+    local limits_snapshot group_present=0 group_snapshot= ownership_snapshot
+    local restore_limits=0 rollback_failed=0
+
+    [[ $# -eq 0 ]] || { ab_error "cleanup-landing does not accept options"; return 1; }
+    require_root
+    require_command_path "$IP_CMD" ip
+    require_command_path "$FLOCK_CMD" flock
+    mkdir -p "$MPTCP_AB_STATE_DIR" "$MPTCP_AB_RUN_DIR"
+    chmod 0755 "$MPTCP_AB_STATE_DIR"
+    exec 9>"$LOCK_FILE"
+    $FLOCK_CMD -n 9 || { ab_error "another switch transaction is active"; return 1; }
+
+    work_dir=$(mktemp -d "$MPTCP_AB_RUN_DIR/cleanup.XXXXXX") || return 1
+    trap 'rm -rf "$work_dir"' EXIT
+    owned=$work_dir/owned
+    current=$work_dir/current
+    empty=$work_dir/empty
+    universe=$work_dir/universe
+    : >"$empty"
+    recover_landing_journal "$work_dir" || return 1
+    load_landing_ownership "$owned" || return 1
+    if [[ $LANDING_OWNERSHIP_PRESENT == 0 ]]; then
+        ab_log "no owned Landing runtime state exists"
+        return 0
+    fi
+    ownership_snapshot=$(cat "$LANDING_OWNERSHIP_FILE")
+    validate_landing_inventory "$owned" "$empty" "$current" "$work_dir/preflight" || return 1
+    build_record_universe "$universe" "$owned"
+    limits_snapshot=$(read_limits) || { ab_error "cannot snapshot MPTCP limits"; return 1; }
+    if [[ $limits_snapshot == "$LANDING_MANAGED_LIMITS" ]]; then
+        restore_limits=1
+    else
+        ab_warn "MPTCP limits changed after this tool last managed them; leaving limits unchanged"
+    fi
+    if [[ -f $ACTIVE_GROUP_FILE ]]; then
+        group_present=1
+        group_snapshot=$(cat "$ACTIVE_GROUP_FILE")
+    fi
+
+    prepare_landing_journal "$current" "$owned" "$universe" "$limits_snapshot" || return 1
+    if remove_endpoint_records "$current" "$work_dir/remove" &&
+       { [[ $restore_limits == 0 ]] || set_limits_values "$LANDING_ORIGINAL_LIMITS"; } &&
+       verify_endpoint_records "$empty" "$universe" "$work_dir/verify" &&
+       { [[ $restore_limits == 0 ]] || [[ $(read_limits 2>/dev/null || true) == "$LANDING_ORIGINAL_LIMITS" ]]; } &&
+       rm -f "$ACTIVE_GROUP_FILE" && rm -f "$LANDING_OWNERSHIP_FILE" && finish_landing_journal; then
+        if [[ $restore_limits == 1 ]]; then
+            ab_log "owned Landing endpoints removed and original MPTCP limits restored"
+        else
+            ab_log "owned Landing endpoints removed; externally changed MPTCP limits were preserved"
+        fi
+        return 0
+    fi
+
+    ab_warn "Landing cleanup failed; restoring previous runtime state"
+    reconcile_endpoint_records "$current" "$owned" "$universe" "$work_dir/rollback" || rollback_failed=1
+    set_limits_values "$limits_snapshot" || rollback_failed=1
+    restore_file_snapshot "$group_present" "$group_snapshot" "$ACTIVE_GROUP_FILE" 0600 || rollback_failed=1
+    restore_file_snapshot 1 "$ownership_snapshot" "$LANDING_OWNERSHIP_FILE" 0600 || rollback_failed=1
+    verify_endpoint_records "$current" "$universe" "$work_dir/rollback-final" || rollback_failed=1
+    ((rollback_failed == 0)) || { ab_error "Landing cleanup rollback was incomplete"; return 2; }
+    finish_landing_journal || return 2
+    ab_log "Landing cleanup rollback completed"
+    return 1
+)
+
+resolve_endpoint_device()
+{
+    local detected
+    [[ $ENDPOINT_DEVICE != auto ]] && return 0
+    detected=$($IP_CMD -4 route show default 2>/dev/null | awk 'NR == 1 {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    [[ -n $detected && $detected =~ ^[A-Za-z0-9_.:-]+$ ]] || {
+        ab_error "cannot detect the default IPv4 interface; set ENDPOINT_DEVICE"
+        return 1
+    }
+    ENDPOINT_DEVICE=$detected
+}
+
+run_switch()
+{
+    local mode=manual requested_group= group latest_group
+    local follow_schedule=0 apply_status=0 convergence_retries=0
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --scheduled) mode=scheduled ;;
+            --boot) mode=boot ;;
+            --group)
+                shift
+                requested_group=${1:-}
+                [[ $requested_group == A || $requested_group == B ]] || { ab_error "--group requires A or B"; return 1; }
+                ;;
+            *) ab_error "unknown switch option: $1"; return 1 ;;
+        esac
+        shift
+    done
+
+    require_root
+    ab_load_config "$MPTCP_AB_CONFIG_FILE"
+    [[ $ROLE != relay ]] || { ab_error "Relay forwarding is always active; use network-apply"; return 1; }
+    require_command_path "$IP_CMD" ip
+    require_command_path "$FLOCK_CMD" flock
+    resolve_endpoint_device
+    if [[ $mode == scheduled && $ROLE == edge && $EDGE_SWITCH_DELAY != 0 ]]; then
+        sleep "$EDGE_SWITCH_DELAY"
+    fi
+    if [[ $mode == boot ]]; then
+        wait_for_boot_time_sync || return 1
+    else
+        time_is_synchronized || { ab_error "time is not synchronized"; return 1; }
+    fi
+    group=${requested_group:-$(ab_desired_group_now)}
+    ab_select_group "$group" || return 1
+    if [[ -z $requested_group ]]; then
+        follow_schedule=1
+    fi
+    mkdir -p "$MPTCP_AB_STATE_DIR" "$MPTCP_AB_RUN_DIR"
+    chmod 0755 "$MPTCP_AB_STATE_DIR"
+    exec 9>"$LOCK_FILE"
+    $FLOCK_CMD -n 9 || { ab_error "another switch transaction is active"; return 1; }
+
+    while :; do
+        set +e
+        case $ROLE in
+            edge) ( set -e; apply_edge "$group" "$mode" "$follow_schedule" ) ;;
+            landing) ( set -e; apply_landing "$group" ) ;;
+        esac
+        apply_status=$?
+        set -e
+
+        if ((apply_status == 75)) && [[ $follow_schedule == 1 ]]; then
+            latest_group=$(ab_desired_group_now) || return 1
+            convergence_retries=$((convergence_retries + 1))
+            if ((convergence_retries > 2)); then
+                ab_error "schedule changed repeatedly while applying the Edge group"
+                return 1
+            fi
+            group=$latest_group
+            continue
+        fi
+        ((apply_status == 0)) || return "$apply_status"
+        [[ $follow_schedule == 1 ]] || return 0
+
+        latest_group=$(ab_desired_group_now) || return 1
+        [[ $latest_group != "$group" ]] || return 0
+        convergence_retries=$((convergence_retries + 1))
+        if ((convergence_retries > 2)); then
+            ab_error "schedule did not stabilize while applying the selected group"
+            return 1
+        fi
+        ab_warn "schedule changed from group $group to $latest_group during the transaction; converging now"
+        group=$latest_group
+    done
+}
+
+run_plan()
+{
+    local group=
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --group) shift; group=${1:-} ;;
+            *) ab_error "unknown plan option: $1"; return 1 ;;
+        esac
+        shift
+    done
+    ab_load_config "$MPTCP_AB_CONFIG_FILE"
+    if [[ $ROLE == relay ]]; then
+        network_plan
+        return 0
+    fi
+    [[ -z $group ]] && group=$(ab_desired_group_now)
+    [[ $group == A || $group == B ]] || { ab_error "group must be A or B"; return 1; }
+    ab_select_group "$group" || return 1
+    [[ $ENDPOINT_DEVICE != auto ]] || ENDPOINT_DEVICE='<default-interface>'
+    case $ROLE in
+        edge) edge_plan "$group" ;;
+        landing) landing_plan "$group" ;;
+    esac
+    network_plan
+}
+
+run_probe()
+{
+    local group=${1:-}
+    local current= candidate rc=1
+    ab_load_config "$MPTCP_AB_CONFIG_FILE"
+    [[ $ROLE == edge ]] || { ab_error "probe is only available on Edge"; return 1; }
+    [[ -n $group ]] || group=$(ab_desired_group_now)
+    [[ $group == A || $group == B ]] || { ab_error "group must be A or B"; return 1; }
+    ab_select_group "$group" || return 1
+    current=$(read_active_target 2>/dev/null || true)
+    current=${current%:*}
+    while IFS= read -r candidate; do
+        if probe_target "$candidate"; then
+            printf '%-21s healthy\n' "$candidate:$(ab_relay_port "$candidate")"
+            rc=0
+        else
+            printf '%-21s failed\n' "$candidate:$(ab_relay_port "$candidate")"
+        fi
+    done < <(ab_group_candidates "$group" "$current")
+    return "$rc"
+}
+
+run_status()
+{
+    local scheduled state limits
+    ab_load_config "$MPTCP_AB_CONFIG_FILE"
+    if [[ $ROLE == relay ]]; then
+        network_plan
+        network_ready
+        return $?
+    fi
+    scheduled=$(ab_desired_group_now)
+    state=$(sed -n '1p' "$ACTIVE_GROUP_FILE" 2>/dev/null || printf 'unknown')
+    limits=$(read_limits 2>/dev/null || printf 'unavailable')
+    printf 'role:              %s\n' "$ROLE"
+    printf 'mode:              %s\n' "$MODE"
+    printf 'scheduled group:   %s\n' "$scheduled"
+    printf 'applied group:     %s\n' "$state"
+    printf 'MPTCP limits:      %s\n' "$limits"
+    if [[ $ROLE == edge ]]; then
+        printf 'active target:     %s\n' "$(read_active_target 2>/dev/null || printf 'unavailable')"
+        printf 'client service:    %s\n' "$($SYSTEMCTL_CMD is-active "$EDGE_SERVICE" 2>/dev/null || printf 'unavailable')"
+    else
+        printf 'managed endpoints:\n'
+        $IP_CMD mptcp endpoint show 2>/dev/null | while IFS= read -r line; do
+            local id
+            id=$(endpoint_line_id "$line" 2>/dev/null || true)
+            if ab_owned_id "$id" 2>/dev/null; then
+                printf '  %s\n' "$line"
+            fi
+        done
+    fi
+    if [[ -n $SYSTEMCTL_CMD ]]; then
+        printf 'switch timer:      %s/%s\n' \
+            "$($SYSTEMCTL_CMD is-enabled mptcp-ab-switch.timer 2>/dev/null || printf 'unknown')" \
+            "$($SYSTEMCTL_CMD is-active mptcp-ab-switch.timer 2>/dev/null || printf 'unknown')"
+    fi
+}
+
+doctor_check()
+{
+    local label=$1
+    shift
+    if "$@"; then
+        printf '[OK]   %s\n' "$label"
+        return 0
+    fi
+    printf '[FAIL] %s\n' "$label"
+    return 1
+}
+
+limits_available()
+{
+    read_limits >/dev/null
+}
+
+active_target_available()
+{
+    read_active_target >/dev/null
+}
+
+kernel_mptcp_enabled()
+{
+    [[ -r /proc/sys/net/mptcp/enabled && $(cat /proc/sys/net/mptcp/enabled) == 1 ]]
+}
+
+landing_listener_is_mptcp()
+{
+    local output address host port
+
+    require_command_path "$SS_CMD" ss || return 1
+    output=$($SS_CMD -4 -H -lnM "sport = :$LANDING_PORT" 2>/dev/null) || return 1
+    while read -r address; do
+        [[ -n $address ]] || continue
+        host=${address%:*}
+        port=${address##*:}
+        [[ $port == "$LANDING_PORT" ]] || continue
+        if [[ $host == '*' || $host == 0.0.0.0 ]]; then
+            return 0
+        fi
+        ab_valid_ipv4 "$host" && [[ $host != 127.* ]] && return 0
+    done < <(printf '%s\n' "$output" | awk '{print $4}')
+    return 1
+}
+
+applied_group_matches_schedule()
+{
+    local desired applied
+    desired=$(ab_desired_group_now) || return 1
+    applied=$(sed -n '1p' "$ACTIVE_GROUP_FILE" 2>/dev/null) || return 1
+    [[ $applied == "$desired" ]]
+}
+
+edge_target_matches_schedule()
+{
+    local desired target ip
+    desired=$(ab_desired_group_now) || return 1
+    target=$(read_active_target) || return 1
+    ip=${target%:*}
+    ab_select_group "$desired" || return 1
+    ab_csv_contains "$AB_GROUP_CSV" "$ip" && [[ ${target##*:} == "$LANDING_PORT" ]]
+}
+
+edge_client_files_match()
+{
+    load_edge_client_env || return 1
+    [[ $CLIENT_LISTEN_ADDRESS == "$LISTEN_ADDRESS" && $CLIENT_SERVER_FILE == "$EDGE_SERVER_FILE" ]] || return 1
+    edge_server_file_metadata_is_safe
+}
+
+landing_runtime_matches_schedule()
+(
+    local desired work_dir owned expected current
+
+    mkdir -p "$MPTCP_AB_RUN_DIR" || return 1
+    work_dir=$(mktemp -d "$MPTCP_AB_RUN_DIR/doctor.XXXXXX") || return 1
+    trap 'rm -rf "$work_dir"' EXIT
+    owned=$work_dir/owned
+    expected=$work_dir/expected
+    current=$work_dir/current
+    desired=$(ab_desired_group_now) || return 1
+    load_landing_ownership "$owned" || return 1
+    [[ $LANDING_OWNERSHIP_PRESENT == 1 ]] || return 1
+    write_expected_endpoints "$desired" "$expected" || return 1
+    validate_landing_inventory "$owned" "$expected" "$current" "$work_dir/inventory" || return 1
+    cmp -s "$owned" "$expected" && cmp -s "$current" "$expected" &&
+        [[ $LANDING_MANAGED_LIMITS == "$SUBFLOWS $ADD_ADDR_ACCEPTED" ]] &&
+        applied_group_matches_schedule && limits_match
+)
+
+load_edge_client_env()
+{
+    local line key value seen='|'
+
+    CLIENT_LISTEN_ADDRESS=
+    CLIENT_SERVER_FILE=
+    [[ -f $CLIENT_ENV_FILE && ! -L $CLIENT_ENV_FILE ]] || {
+        ab_error "Edge client environment is not a regular file: $CLIENT_ENV_FILE"
+        return 1
+    }
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line == *=* ]] || { ab_error "invalid Edge client environment line"; return 1; }
+        key=${line%%=*}
+        value=${line#*=}
+        [[ $seen != *"|$key|"* ]] || { ab_error "duplicate Edge client environment key: $key"; return 1; }
+        seen="${seen}${key}|"
+        case $key in
+            LISTEN_ADDRESS) CLIENT_LISTEN_ADDRESS=$value ;;
+            SERVER_FILE) CLIENT_SERVER_FILE=$value ;;
+            *) ab_error "unknown Edge client environment key: $key"; return 1 ;;
+        esac
+    done <"$CLIENT_ENV_FILE"
+    [[ -n $CLIENT_LISTEN_ADDRESS && -n $CLIENT_SERVER_FILE ]] || {
+        ab_error "Edge client environment is incomplete"
+        return 1
+    }
+}
+
+edge_server_file_metadata_is_safe()
+{
+    local metadata owner mode size
+
+    require_command_path "$STAT_CMD" stat || return 1
+    [[ -f $EDGE_SERVER_FILE && ! -L $EDGE_SERVER_FILE ]] || return 1
+    metadata=$($STAT_CMD -c '%u %a %s' -- "$EDGE_SERVER_FILE" 2>/dev/null) || return 1
+    read -r owner mode size <<<"$metadata"
+    [[ $owner == 0 && $mode == 644 ]] || return 1
+    ab_is_uint "$size" && ((10#$size <= 1024))
+}
+
+run_doctor()
+{
+    local failures=0
+    if ab_load_config "$MPTCP_AB_CONFIG_FILE"; then
+        printf '[OK]   configuration\n'
+    else
+        printf '[FAIL] configuration\n'
+        return 1
+    fi
+    doctor_check 'managed port mapping / forwarding' network_ready || failures=$((failures + 1))
+    if [[ $ROLE == relay ]]; then
+        doctor_check 'network service active' "$SYSTEMCTL_CMD" is-active --quiet mptcp-ab-network.service || failures=$((failures + 1))
+        ((failures == 0))
+        return $?
+    fi
+    resolve_endpoint_device || failures=$((failures + 1))
+    doctor_check 'Linux MPTCP enabled' kernel_mptcp_enabled || failures=$((failures + 1))
+    doctor_check 'configured MPTCP limits applied' limits_match || failures=$((failures + 1))
+    doctor_check 'time synchronized or check disabled' time_is_synchronized || failures=$((failures + 1))
+    doctor_check 'scheduled group applied' applied_group_matches_schedule || failures=$((failures + 1))
+    doctor_check 'bootstrap service active' "$SYSTEMCTL_CMD" is-active --quiet mptcp-ab-bootstrap.service || failures=$((failures + 1))
+    if [[ $ROLE == edge ]]; then
+        doctor_check 'Edge tunnel binary executable' test -x "$EDGE_BINARY" || failures=$((failures + 1))
+        doctor_check 'Edge target state valid' active_target_available || failures=$((failures + 1))
+        doctor_check 'Edge target belongs to scheduled group' edge_target_matches_schedule || failures=$((failures + 1))
+        doctor_check 'Edge client files match and are readable' edge_client_files_match || failures=$((failures + 1))
+        doctor_check 'Edge client service active' "$SYSTEMCTL_CMD" is-active --quiet "$EDGE_SERVICE" || failures=$((failures + 1))
+        doctor_check 'Edge listener active' listener_ready || failures=$((failures + 1))
+    else
+        doctor_check "Landing port $LANDING_PORT is an MPTCP listener" landing_listener_is_mptcp || failures=$((failures + 1))
+        doctor_check 'Landing endpoints match the scheduled group' landing_runtime_matches_schedule || failures=$((failures + 1))
+        if [[ $LANDING_SERVICE != - ]]; then
+            doctor_check 'Landing application service active' "$SYSTEMCTL_CMD" is-active --quiet "$LANDING_SERVICE" || failures=$((failures + 1))
+        fi
+    fi
+    doctor_check 'switch timer enabled' "$SYSTEMCTL_CMD" is-enabled --quiet mptcp-ab-switch.timer || failures=$((failures + 1))
+    doctor_check 'switch timer active' "$SYSTEMCTL_CMD" is-active --quiet mptcp-ab-switch.timer || failures=$((failures + 1))
+    ((failures == 0))
+}
+
+run_validate_runtime()
+{
+    local inherited_listen=${LISTEN_ADDRESS:-}
+    local inherited_server=${SERVER_FILE:-}
+
+    ab_load_config "$MPTCP_AB_CONFIG_FILE"
+    [[ $ROLE == edge ]] || { ab_error "client unit requires ROLE=edge"; return 1; }
+    load_edge_client_env || return 1
+    [[ $CLIENT_LISTEN_ADDRESS == "$LISTEN_ADDRESS" && $CLIENT_SERVER_FILE == "$EDGE_SERVER_FILE" ]] || {
+        ab_error "Edge client environment does not match the main configuration"
+        return 1
+    }
+    if [[ -n $inherited_listen || -n $inherited_server ]]; then
+        [[ $inherited_listen == "$CLIENT_LISTEN_ADDRESS" && $inherited_server == "$CLIENT_SERVER_FILE" ]] || {
+            ab_error "systemd loaded Edge client values that differ from $CLIENT_ENV_FILE"
+            return 1
+        }
+    fi
+    [[ -x $EDGE_BINARY ]] || { ab_error "Edge tunnel binary is not executable: $EDGE_BINARY"; return 1; }
+    read_active_target >/dev/null || { ab_error "Edge target state is invalid"; return 1; }
+    edge_server_file_metadata_is_safe || { ab_error "Edge target state must be a root-owned, non-symlink 0644 file no larger than 1024 bytes"; return 1; }
+    kernel_mptcp_enabled || { ab_error "Linux MPTCP is not enabled"; return 1; }
+}
+
+command_name=${1:-}
+[[ -n $command_name ]] || { usage; exit 2; }
+shift || :
+
+case $command_name in
+    validate-config)
+        ab_load_config "${1:-$MPTCP_AB_CONFIG_FILE}"
+        printf 'configuration is valid\n'
+        ;;
+    current-group)
+        ab_load_config "$MPTCP_AB_CONFIG_FILE"
+        ab_desired_group_for_hhmm "${1:-$(TZ=$TIMEZONE date +%H%M)}"
+        ;;
+    plan) run_plan "$@" ;;
+    switch) run_switch "$@" ;;
+    cleanup-landing) run_cleanup_landing "$@" ;;
+    probe) run_probe "$@" ;;
+    status) run_status ;;
+    doctor) run_doctor ;;
+    validate-runtime) run_validate_runtime ;;
+    network-plan) ab_load_config "$MPTCP_AB_CONFIG_FILE"; network_render_rules ;;
+    network-apply) ab_load_config "$MPTCP_AB_CONFIG_FILE"; network_apply ;;
+    network-cleanup) network_apply cleanup ;;
+    help|-h|--help) usage ;;
+    *) ab_error "unknown command: $command_name"; usage; exit 2 ;;
+esac

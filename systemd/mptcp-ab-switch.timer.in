@@ -1,0 +1,15 @@
+[Unit]
+Description=Switch MPTCP relay groups on schedule
+
+[Timer]
+OnCalendar=@A_ON_CALENDAR@
+OnCalendar=@B_ON_CALENDAR@
+OnActiveSec=60s
+OnUnitInactiveSec=60s
+Persistent=true
+AccuracySec=1ms
+RandomizedDelaySec=0
+Unit=mptcp-ab-switch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,153 @@
+#!/usr/bin/expect -f
+set timeout 15
+set root [file dirname [file dirname [file normalize [info script]]]]
+log_user 0
+proc answer {prompt value} {
+    expect {
+        -exact $prompt { send -- "$value\r" }
+        timeout { puts stderr "Missing prompt: $prompt"; exit 1 }
+        eof { puts stderr "Unexpected end at prompt: $prompt"; exit 1 }
+    }
+}
+spawn -noecho bash $root/install.sh plan --role edge
+answer "Relay public TCP port" "70000"
+answer "Relay public TCP port" "21000"
+answer "Landing application MPTCP port" "22000"
+answer "Mode (aggregate, scheduled)" "scheduled"
+answer "A relay IPv4 addresses" "192.0.2.1,192.0.2.2"
+answer "A preferred primary relay" "192.0.2.1"
+answer "B relay IPv4 addresses" "192.0.2.3"
+answer "B preferred primary relay" "192.0.2.3"
+answer "Customize individual Relay public ports?" "yes"
+answer "Public TCP port for Relay 192.0.2.1" "21001"
+answer "Public TCP port for Relay 192.0.2.2" "21002"
+answer "Public TCP port for Relay 192.0.2.3" "21003"
+answer "Schedule timezone" "UTC"
+answer "A group starts" "08:30"
+answer "B group starts" "08:30"
+answer "B group starts" "23:45"
+answer "Default network interface" "eth0"
+answer "Edge local listen IPv4" "127.0.0.1"
+answer "Edge local listen TCP port" "23000"
+answer "Scheduled Edge delay" "0.5"
+answer "Use preferred primary" "no"
+answer "Require synchronized" "no"
+answer "Apply an FQ" "no"
+answer "Use BBR" "no"
+answer "Customize advanced MPTCP" "no"
+expect {
+    -exact "edge_listen=127.0.0.1:23000" {}
+    timeout { puts stderr "Missing Edge port in plan"; exit 1 }
+    eof { puts stderr "Installer failed"; exit 1 }
+}
+expect {
+    -exact "relay_target=192.0.2.2:21002" {}
+    timeout { puts stderr "Missing individual Relay port"; exit 1 }
+    eof { puts stderr "Installer failed"; exit 1 }
+}
+expect {
+    -exact "schedule=0830-2345 UTC" {}
+    timeout { puts stderr "Missing custom schedule"; exit 1 }
+    eof { puts stderr "Installer failed"; exit 1 }
+}
+expect eof
+set result [wait]
+if {[lindex $result 3] != 0} { exit 1 }
+
+spawn -noecho bash $root/install.sh
+answer "Action (install, reconfigure, plan, doctor, uninstall)" "plan"
+answer "Role (edge, relay, landing)" "relay"
+answer "Relay public TCP port" "31001"
+answer "Landing application MPTCP port" "22000"
+answer "Relay local destination IPv4" "0.0.0.0"
+answer "Landing reachable IPv4 address" "127.0.0.1"
+answer "Landing reachable IPv4 address" "198.51.100.10"
+answer "Default network interface" "eth0"
+answer "Apply an FQ" "no"
+answer "Use BBR" "no"
+expect {
+    -exact "relay_listen=0.0.0.0:31001" {}
+    timeout { puts stderr "Missing Relay public port"; exit 1 }
+    eof { puts stderr "Relay wizard failed"; exit 1 }
+}
+expect {
+    -exact "forward_to=198.51.100.10:22000" {}
+    timeout { puts stderr "Missing Relay destination"; exit 1 }
+    eof { puts stderr "Relay wizard failed"; exit 1 }
+}
+expect eof
+set result [wait]
+if {[lindex $result 3] != 0} { exit 1 }
+
+spawn -noecho bash $root/install.sh plan --role landing
+answer "Relay public TCP port" "21000"
+answer "Landing application MPTCP port" "22000"
+answer "Mode (aggregate, scheduled)" "scheduled"
+answer "A relay IPv4 addresses" "192.0.2.1,192.0.2.2"
+answer "A preferred primary relay" "192.0.2.1"
+answer "B relay IPv4 addresses" "192.0.2.1"
+answer "B relay IPv4 addresses" "192.0.2.3"
+answer "B preferred primary relay" "192.0.2.3"
+answer "Customize individual Relay public ports?" "no"
+answer "Schedule timezone" "UTC"
+answer "A group starts" "23:45"
+answer "B group starts" "08:30"
+answer "Default network interface" "eth0"
+answer "Install the bundled MPTCP server" "yes"
+answer "Landing TCP backend IPv4:port" "127.0.0.1:23000"
+answer "Require synchronized" "no"
+answer "Apply an FQ" "no"
+answer "Use BBR" "no"
+answer "Customize advanced MPTCP" "no"
+expect {
+    -exact "landing_listener_port=22000" {}
+    timeout { puts stderr "Missing Landing listener port"; exit 1 }
+    eof { puts stderr "Landing wizard failed"; exit 1 }
+}
+expect {
+    -exact "schedule=2345-0830 UTC" {}
+    timeout { puts stderr "Missing wrapped schedule"; exit 1 }
+    eof { puts stderr "Landing wizard failed"; exit 1 }
+}
+expect eof
+set result [wait]
+if {[lindex $result 3] != 0} { exit 1 }
+
+spawn -noecho bash $root/install.sh plan --role edge
+answer "Relay public TCP port" "21001"
+answer "Landing application MPTCP port" "22000"
+answer "Mode (aggregate, scheduled)" ""
+answer "Simultaneous relay IPv4 addresses" "192.0.2.1"
+answer "Simultaneous relay IPv4 addresses" "192.0.2.1,192.0.2.2"
+answer "A preferred primary relay" "192.0.2.1"
+answer "Customize individual Relay public ports?" "yes"
+answer "Public TCP port for Relay 192.0.2.1" "21001"
+answer "Public TCP port for Relay 192.0.2.2" "21002"
+answer "Default network interface" "eth0"
+answer "Edge local listen IPv4" "127.0.0.1"
+answer "Edge local listen TCP port" "18080"
+answer "Use preferred primary" "no"
+answer "Apply an FQ" "no"
+answer "Use BBR" "no"
+answer "Customize advanced MPTCP" "yes"
+answer "Managed endpoint ID base" "250"
+answer "Managed endpoint ID base" "120"
+answer "Maximum additional MPTCP subflows" "0"
+answer "Maximum additional MPTCP subflows" "3"
+answer "Maximum accepted remote addresses" "4"
+answer "Relay probe timeout in seconds" "60"
+answer "Relay probe timeout in seconds" "4"
+answer "Relay probe attempts" "3"
+expect {
+    -exact "limits=3/4" {}
+    timeout { puts stderr "Missing custom subflow limits"; exit 1 }
+    eof { puts stderr "Advanced aggregate wizard failed"; exit 1 }
+}
+expect {
+    -exact "schedule=always-on" {}
+    timeout { puts stderr "Missing aggregate mode in plan"; exit 1 }
+    eof { puts stderr "Aggregate wizard failed"; exit 1 }
+}
+expect eof
+set result [wait]
+exit [lindex $result 3]

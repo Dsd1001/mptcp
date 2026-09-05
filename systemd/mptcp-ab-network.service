@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply MPTCP relay port mappings and forwarding
+Wants=network-online.target
+After=network-online.target systemd-sysctl.service
+Before=mptcp-ab-bootstrap.service mptcp-port-tunnel-client.service
+ConditionPathExists=/etc/mptcp-ab/config.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mptcp-abctl network-apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

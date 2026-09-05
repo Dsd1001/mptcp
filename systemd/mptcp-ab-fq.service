@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply the FQ root qdisc used by the MPTCP tunnel
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/mptcp-ab/interface.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/mptcp-ab/interface.env
+ExecStart=/usr/sbin/tc qdisc replace dev ${NETWORK_INTERFACE} root fq
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
