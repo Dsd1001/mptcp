@@ -14,8 +14,6 @@
 !/scripts/
 !/docs/
 !/payload/
-!/macos/
-macos/build/
 **/.DS_Store
 **/._*
 **/__pycache__/
