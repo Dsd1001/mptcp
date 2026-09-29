@@ -1,4 +1,16 @@
-# MPTCP 聚合与定时切换交互式部署工具
+# MPTCP 聚合与交互式部署
+
+## Userspace 0.9.5 / MPX/3 Rev5
+
+当前 Userspace 支持 Auto / Aggregate / Protect / Weighted 四种策略、2048 个逻辑流、128 MiB 会话信用以及独立有界的 DATA/control/接收内存。Weighted 每条 Relay 下行能力必填、上行能力选填；实时 RTT、队列、penalty、delivery timeout、reinject 和重传保护仍然生效。
+
+0.9.5 新增可选“后台常驻”：MPTCP Desk 可以注册 macOS 登录项、记住“转发应保持运行”的用户意图、监听睡眠/唤醒、等待网络恢复后重建 engine/session。engine 意外退出时按 1/2/5/10/30 秒有界退避，连续 5 次仍未恢复则停止本轮自动重试；用户手动点击“停止”会清除运行意图，不会被自动拉起。
+
+线协议仍是 Rev5，与 0.9.4 完全一致，因此 0.9.5 Mac 可以继续连接 0.9.4 Landing 使用 Weighted；Auto/Aggregate/Protect 保持与 0.9.3 hello 兼容。发行、部署和协议说明见 `docs/userspace/RELEASE.zh-CN.md`、`DEPLOYMENT.zh-CN.md`、`PROTOCOL.md`。PROVENANCE、容量矩阵和真实 App+Surge 现场仍是独立证据，pending/not-run 不代表已经完成性能验收。
+
+下面章节仍描述原 Linux Native 安装器，不是新版 Landing 二进制的部署流程。
+
+## 原 Native 安装包
 
 发布安装包：运行 `bash scripts/package-public.sh`，输出到 `dist/`。
 发布脚本采用文件白名单，扫描源码目录和压缩包，并排除本地部署报告与旧归档。

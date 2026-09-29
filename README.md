@@ -1,8 +1,17 @@
 # Interactive MPTCP Aggregation And Scheduling
 
-[Full Chinese documentation](README.zh-CN.md)
+## Userspace Multipath 0.9.5 / MPX/3 Rev5
 
-## Publication Package
+The current Userspace release provides Auto / Aggregate / Protect / Weighted scheduling, 2048 logical streams, 128 MiB session credit and independently bounded DATA/control/receive-memory planes. Weighted accepts a required per-Relay download capacity and optional upload capacity; live RTT, queue, penalty, delivery-timeout, reinjection and retransmission safety remain active.
+
+0.9.5 adds an optional macOS background-resident mode. MPTCP Desk can register itself as a macOS login item, remember whether forwarding should stay running, detect sleep/wake, wait for network availability and rebuild the engine/session after wake. Unexpected engine exits use a bounded 1/2/5/10/30-second retry sequence and stop after five consecutive failed starts; an explicit Stop clears the run intent and suppresses automatic restart.
+
+The wire protocol remains capability revision 5 and is unchanged from 0.9.4, so a 0.9.5 Mac can use Weighted with a 0.9.4 Landing. Auto/Aggregate/Protect retain the 0.9.3-compatible hello values. See `docs/userspace/RELEASE.zh-CN.md`, `DEPLOYMENT.zh-CN.md` and `PROTOCOL.md` for release and compatibility details. Build provenance, capacity and physical App/Surge acceptance remain separate evidence; pending/not-run receipts are not performance claims.
+
+The sections below describe the original Linux Native MPTCP installer, not the
+Userspace Landing menu or its release package.
+
+## Publication Package (original Native installer)
 
 Run `bash scripts/package-public.sh` to build a checked, redistributable package
 in `dist/`. This uses an explicit allowlist and scans both the staged files and
